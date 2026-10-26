@@ -24,16 +24,31 @@ const VOICE_ID = process.env.SYNC_VOICE_ID;
 const MODEL = process.env.SYNC_MODEL || "lipsync-2";
 
 const REFERENCE_VIDEO = path.resolve(
-  process.env.REFERENCE_VIDEO || "./videos/reference.mp4",
+  process.env.REFERENCE_VIDEO || "./videos/all-cuts/reference.mp4",
 );
-const ENDING_VIDEO = path.resolve(
-  process.env.ENDING_VIDEO || "./videos/ending.mp4",
-);
+
+const ENDING_VIDEOS = {
+  extraSmall: path.resolve(
+    process.env.EXTRA_SMALL_ENDING_VIDEO ||
+      "./videos/all-cuts/all-endings/extra-small-name-ending.mp4",
+  ),
+  small: path.resolve(
+    process.env.SMALL_ENDING_VIDEO ||
+      "./videos/all-cuts/all-endings/small-name-ending.mp4",
+  ),
+  medium: path.resolve(
+    process.env.MEDIUM_ENDING_VIDEO ||
+      "./videos/all-cuts/all-endings/medium-name-ending.mp4",
+  ),
+  big: path.resolve(
+    process.env.BIG_ENDING_VIDEO ||
+      "./videos/all-cuts/all-endings/big-name-ending.mp4",
+  ),
+};
 
 const OUTPUT_DIR = path.resolve(process.env.OUTPUT_DIR || "./output");
 
 const GENERATED_DIR = path.join(OUTPUT_DIR, "sync-generated");
-
 const FINAL_DIR = path.join(OUTPUT_DIR, "final");
 
 fs.mkdirSync(GENERATED_DIR, { recursive: true });
@@ -56,12 +71,16 @@ function validateConfiguration() {
     throw new Error("SYNC_VOICE_ID is missing from .env");
   }
 
-  if (!fs.existsSync(ENDING_VIDEO)) {
-    throw new Error(`Ending video was not found: ${ENDING_VIDEO}`);
-  }
-
   if (!fs.existsSync(REFERENCE_VIDEO)) {
     throw new Error(`Reference video was not found: ${REFERENCE_VIDEO}`);
+  }
+
+  for (const [endingType, endingPath] of Object.entries(ENDING_VIDEOS)) {
+    if (!fs.existsSync(endingPath)) {
+      throw new Error(
+        `Ending video for "${endingType}" was not found: ${endingPath}`,
+      );
+    }
   }
 }
 
@@ -71,19 +90,19 @@ function validateConfiguration() {
 
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
-    const process = spawn(ffmpegPath, args, {
+    const child = spawn(ffmpegPath, args, {
       stdio: ["ignore", "ignore", "pipe"],
     });
 
     let errorOutput = "";
 
-    process.stderr.on("data", (data) => {
+    child.stderr.on("data", (data) => {
       errorOutput += data.toString();
     });
 
-    process.on("error", reject);
+    child.on("error", reject);
 
-    process.on("close", (code) => {
+    child.on("close", (code) => {
       if (code === 0) {
         resolve();
       } else {
@@ -131,7 +150,7 @@ async function sync(endpoint, options = {}) {
 }
 
 // --------------------------------------------------
-// Upload a video to Sync
+// Upload video to Sync
 // --------------------------------------------------
 
 async function uploadVideo(filePath) {
@@ -157,8 +176,7 @@ async function uploadVideo(filePath) {
     );
   }
 
-  // Send the exact buffer length required by the signed upload URL.
-  // Do not send the Sync API key to this signed URL.
+  // Upload to the signed URL without sending the Sync API key.
   const uploadResponse = await fetch(upload.uploadUrl, {
     method: "PUT",
     headers: {
@@ -194,30 +212,13 @@ async function uploadVideo(filePath) {
   return asset.id;
 }
 
-async function getAudioDuration(audioUrl) {
-  const response = await fetch(audioUrl);
-
-  if (!response.ok) {
-    throw new Error(`Audio download failed: HTTP ${response.status}`);
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const tempAudioPath = path.join(
-    os.tmpdir(),
-    `audio-${crypto.randomUUID()}.mp3`,
-  );
-
-  try {
-    fs.writeFileSync(tempAudioPath, buffer);
-    return await getVideoDuration(tempAudioPath);
-  } finally {
-    fs.rmSync(tempAudioPath, { force: true });
-  }
-}
+// --------------------------------------------------
+// Get media duration using FFprobe
+// --------------------------------------------------
 
 async function getVideoDuration(filePath) {
   return new Promise((resolve, reject) => {
-    const process = spawn(ffprobe.path, [
+    const child = spawn(ffprobe.path, [
       "-v",
       "error",
       "-show_entries",
@@ -230,19 +231,19 @@ async function getVideoDuration(filePath) {
     let stdout = "";
     let stderr = "";
 
-    process.stdout.on("data", (data) => {
+    child.stdout.on("data", (data) => {
       stdout += data.toString();
     });
 
-    process.stderr.on("data", (data) => {
+    child.stderr.on("data", (data) => {
       stderr += data.toString();
     });
 
-    process.on("error", reject);
+    child.on("error", reject);
 
-    process.on("close", (code) => {
+    child.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(`FFprobe failed: $DIL0`));
+        return reject(new Error(`FFprobe failed: ${stderr}`));
       }
 
       const duration = Number(stdout.trim());
@@ -257,7 +258,33 @@ async function getVideoDuration(filePath) {
 }
 
 // --------------------------------------------------
-// Generate speech using the existing cloned voice
+// Download generated audio temporarily and measure it
+// --------------------------------------------------
+
+async function getAudioDuration(audioUrl) {
+  const response = await fetch(audioUrl);
+
+  if (!response.ok) {
+    throw new Error(`Audio download failed: HTTP ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  const tempAudioPath = path.join(
+    os.tmpdir(),
+    `audio-${crypto.randomUUID()}.mp3`,
+  );
+
+  try {
+    fs.writeFileSync(tempAudioPath, buffer);
+    return await getVideoDuration(tempAudioPath);
+  } finally {
+    fs.rmSync(tempAudioPath, { force: true });
+  }
+}
+
+// --------------------------------------------------
+// Generate speech using the configured voice
 // --------------------------------------------------
 
 async function generateSpeech(name) {
@@ -279,6 +306,42 @@ async function generateSpeech(name) {
   }
 
   return speech;
+}
+
+// --------------------------------------------------
+// Choose ending based on measured audio duration
+// --------------------------------------------------
+
+function selectEndingVideo(audioDuration) {
+  if (audioDuration >= 1.25 && audioDuration < 1.3) {
+    return {
+      type: "extra-small",
+      path: ENDING_VIDEOS.extraSmall,
+    };
+  }
+
+  if (audioDuration >= 1.3 && audioDuration < 1.45) {
+    return {
+      type: "small",
+      path: ENDING_VIDEOS.small,
+    };
+  }
+
+  if (audioDuration >= 1.45 && audioDuration < 1.5) {
+    return {
+      type: "medium",
+      path: ENDING_VIDEOS.medium,
+    };
+  }
+
+  if (audioDuration >= 1.5 && audioDuration <= 1.7) {
+    return {
+      type: "big",
+      path: ENDING_VIDEOS.big,
+    };
+  }
+
+  return null;
 }
 
 // --------------------------------------------------
@@ -359,7 +422,7 @@ async function waitForGeneration(generationId) {
 }
 
 // --------------------------------------------------
-// Download the generated video
+// Download generated video
 // --------------------------------------------------
 
 async function downloadVideo(url, destination) {
@@ -427,7 +490,7 @@ async function normalizeVideo(inputPath, outputPath) {
 }
 
 // --------------------------------------------------
-// Merge Sync-generated video + ending video
+// Merge generated video + selected ending video
 // --------------------------------------------------
 
 async function mergeVideos(
@@ -453,7 +516,6 @@ async function mergeVideos(
     const concatFile = path.join(tempDir, "concat.txt");
 
     await normalizeVideo(generatedVideoPath, normalizedGenerated);
-
     await normalizeVideo(endingVideoPath, normalizedEnding);
 
     const escapePath = (filePath) =>
@@ -508,9 +570,6 @@ app.get("/health", (req, res) => {
 // --------------------------------------------------
 
 app.post("/generate-invitation", async (req, res) => {
-  let generatedPath;
-  let finalPath;
-
   try {
     validateConfiguration();
 
@@ -523,7 +582,7 @@ app.post("/generate-invitation", async (req, res) => {
       });
     }
 
-    // 1. Measure reference video duration
+    // 1. Measure reference video duration.
     const referenceVideoDuration = await getVideoDuration(REFERENCE_VIDEO);
 
     console.log(
@@ -534,32 +593,50 @@ app.post("/generate-invitation", async (req, res) => {
 
     const outputFileName = `invitation_${id}`;
 
-    generatedPath = path.join(GENERATED_DIR, `${id}-name.mp4`);
+    const generatedPath = path.join(GENERATED_DIR, `${id}-name.mp4`);
 
-    finalPath = path.join(FINAL_DIR, `${id}-final.mp4`);
+    const finalPath = path.join(FINAL_DIR, `${id}-final.mp4`);
 
     console.log("Starting invitation generation:", {
       id,
       name,
     });
 
-    // 1. Generate Hindi speech.
+    // 2. Generate speech.
     const speech = await generateSpeech(name);
 
+    // 3. Measure the actual generated audio duration.
     const audioDuration = await getAudioDuration(speech.url);
 
     console.log(
       `Generated audio duration: ${audioDuration.toFixed(3)} seconds`,
     );
 
-    console.log("Speech generated.");
+    // 4. Select ending based on audio duration, not name length.
+    const selectedEnding = selectEndingVideo(audioDuration);
 
-    // 2. Upload the existing video used by your current Sync request.
+    if (!selectedEnding) {
+      return res.status(422).json({
+        success: false,
+        error: `Generated audio duration ${audioDuration.toFixed(3)} seconds is outside the supported range of 1.25–1.70 seconds. No ending video was selected.`,
+        generatedAudioSeconds: Number(audioDuration.toFixed(3)),
+        supportedRangeSeconds: {
+          min: 1.25,
+          max: 1.7,
+        },
+      });
+    }
+
+    console.log(
+      `Selected ending (${selectedEnding.type}): ${selectedEnding.path}`,
+    );
+
+    // 5. Upload the reference video to Sync.
     const videoAssetId = await uploadVideo(REFERENCE_VIDEO);
 
     console.log("Video uploaded to Sync:", videoAssetId);
 
-    // 3. Generate the Sync lip-synced video.
+    // 6. Generate the lip-synced video.
     const generationId = await startVideoGeneration({
       videoAssetId,
       speechUrl: speech.url,
@@ -568,29 +645,34 @@ app.post("/generate-invitation", async (req, res) => {
 
     console.log("Generation ID:", generationId);
 
-    // 4. Wait until Sync has finished generating the video.
+    // 7. Wait for Sync to finish.
     const generatedVideoUrl = await waitForGeneration(generationId);
 
-    // 5. Save the untouched Sync-generated video separately.
+    // 8. Download the generated video.
     await downloadVideo(generatedVideoUrl, generatedPath);
 
-    // 6. Measure generated video duration
+    // 9. Measure the generated video duration.
     const generatedVideoDuration = await getVideoDuration(generatedPath);
 
     console.log(
       `Generated video duration: ${generatedVideoDuration.toFixed(3)} seconds`,
     );
 
-    // 6. Merge a normalized copy with the ending clip.
-    //    The original generatedPath file is not overwritten.
-    await mergeVideos(generatedPath, ENDING_VIDEO, finalPath);
+    // 10. Merge the generated video with the selected ending.
+    await mergeVideos(generatedPath, selectedEnding.path, finalPath);
 
-    // 7. Return both video URLs.
+    // 11. Return the generated and final video details.
     return res.status(200).json({
       success: true,
       id,
       name,
       generationId,
+
+      selectedEnding: {
+        type: selectedEnding.type,
+        file: path.basename(selectedEnding.path),
+      },
+
       durations: {
         referenceVideoSeconds: Number(referenceVideoDuration.toFixed(3)),
         generatedAudioSeconds: Number(audioDuration.toFixed(3)),
@@ -622,7 +704,6 @@ app.post("/generate-invitation", async (req, res) => {
 // --------------------------------------------------
 
 app.use("/sync-generated", express.static(GENERATED_DIR));
-
 app.use("/final", express.static(FINAL_DIR));
 
 // --------------------------------------------------
